@@ -1,0 +1,164 @@
+diff --git a/libs/renderengine/include/renderengine/DisplaySettings.h b/libs/renderengine/include/renderengine/DisplaySettings.h
+--- a/libs/renderengine/include/renderengine/DisplaySettings.h
++++ b/libs/renderengine/include/renderengine/DisplaySettings.h
+@@ -28,6 +28,7 @@
+ #include <ui/Region.h>
+ #include <ui/Transform.h>
+ 
++#include <array>
+ #include <optional>
+ 
+ namespace android {
+@@ -39,6 +40,9 @@
+     // A string containing the name of the display, along with its id, if it has
+     // one.
+     std::string namePlusId;
++
++    // Optional normalized projective transform of the physical panel.
++    std::optional<std::array<double, 9>> panelKeystone;
+ 
+     // Rectangle describing the physical display. We will project from the
+     // logical clip onto this rectangle.
+@@ -109,6 +113,7 @@
+ 
+ static inline bool operator==(const DisplaySettings& lhs, const DisplaySettings& rhs) {
+     return lhs.namePlusId == rhs.namePlusId && lhs.physicalDisplay == rhs.physicalDisplay &&
++            lhs.panelKeystone == rhs.panelKeystone &&
+             lhs.clip == rhs.clip && lhs.maxLuminance == rhs.maxLuminance &&
+             lhs.currentLuminanceNits == rhs.currentLuminanceNits &&
+             lhs.outputDataspace == rhs.outputDataspace &&
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -54,6 +54,7 @@
+ #pragma clang diagnostic pop // ignored "-Wconversion"
+ 
+ #include <android-base/properties.h>
++#include <renderengine/KeystoneTransform.h>
+ #include <ui/DebugUtils.h>
+ #include <ui/HdrCapabilities.h>
+ 
+@@ -69,6 +70,12 @@
+ using CompositionStrategyPredictionState =
+         OutputCompositionState::CompositionStrategyPredictionState;
+ namespace {
++
++// First hardware trial. The switch is read once by SurfaceFlinger.
++bool hy300KeystoneEnabled() {
++    static const bool enabled = base::GetBoolProperty("persist.debug.sf.hy300_keystone", false);
++    return enabled;
++}
+ 
+ template <typename T>
+ class Reversed {
+@@ -858,12 +865,14 @@
+ 
+     mLayerRequestingBackgroundBlur = findLayerRequestingBackgroundComposition();
+     bool forceClientComposition = mLayerRequestingBackgroundBlur != nullptr;
++    const bool keystone = hy300KeystoneEnabled() && getState().layerFilter.toInternalDisplay &&
++            getDisplayIdVariant().and_then(asPhysicalDisplayId).has_value();
+ 
+     auto* properties = getOverlaySupport();
+ 
+     for (auto* layer : getOutputLayersOrderedByZ()) {
+         layer->updateCompositionState(refreshArgs.updatingGeometryThisFrame,
+-                                      refreshArgs.devOptForceClientComposition ||
++                                      refreshArgs.devOptForceClientComposition || keystone ||
+                                               forceClientComposition,
+                                       refreshArgs.internalDisplayRotationFlags,
+                                       properties ? properties->lutProperties : std::nullopt);
+@@ -1459,6 +1468,13 @@
+ 
+     renderengine::DisplaySettings clientCompositionDisplay;
+     clientCompositionDisplay.namePlusId = mNamePlusId;
++    if (hy300KeystoneEnabled() && outputState.layerFilter.toInternalDisplay &&
++        getDisplayIdVariant().and_then(asPhysicalDisplayId).has_value()) {
++        // Stock wire order: bottom-left, top-left, top-right, bottom-right.
++        constexpr hy300::Corners offsets{{{0, 0}, {.07, .025}, {.07, .025}, {0, 0}}};
++        clientCompositionDisplay.panelKeystone =
++                hy300::projection(hy300::fromStockOffsets(offsets));
++    }
+     clientCompositionDisplay.physicalDisplay = outputState.framebufferSpace.getContent();
+     clientCompositionDisplay.clip = outputState.layerStackSpace.getContent();
+     clientCompositionDisplay.orientation =
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -640,6 +640,17 @@
+ 
+     canvas->clipRect(getSkRect(display.physicalDisplay));
+     canvas->translate(display.physicalDisplay.left, display.physicalDisplay.top);
++    if (display.panelKeystone && display.physicalDisplay.width() > 0 &&
++        display.physicalDisplay.height() > 0) {
++        const auto& m = *display.panelKeystone;
++        const auto w = static_cast<SkScalar>(display.physicalDisplay.width());
++        const auto h = static_cast<SkScalar>(display.physicalDisplay.height());
++        SkMatrix warp;
++        warp.setAll(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);
++        canvas->scale(w, h);
++        canvas->concat(warp);
++        canvas->scale(1 / w, 1 / h);
++    }
+ 
+     const auto clipWidth = display.clip.width();
+     const auto clipHeight = display.clip.height();
+diff --git a/libs/renderengine/include/renderengine/KeystoneTransform.h b/libs/renderengine/include/renderengine/KeystoneTransform.h
+new file mode 100644
+--- /dev/null
++++ b/libs/renderengine/include/renderengine/KeystoneTransform.h
+@@ -0,0 +1,55 @@
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <optional>
++
++namespace hy300 {
++
++struct Point {
++    double x;
++    double y;
++};
++
++// Coordinates are top-left origin and normalized to the panel dimensions.
++// The stock Parcel encodes inward offsets in BL, TL, TR, BR order.
++using Corners = std::array<Point, 4>;
++using Matrix = std::array<double, 9>;
++
++inline Corners fromStockOffsets(const Corners& offsets) {
++    return {{{offsets[1].x, offsets[1].y},
++             {1 - offsets[2].x, offsets[2].y},
++             {1 - offsets[3].x, 1 - offsets[3].y},
++             {offsets[0].x, 1 - offsets[0].y}}};
++}
++
++inline std::optional<Matrix> projection(const Corners& corners) {
++    constexpr double epsilon = 1e-8;
++    for (std::size_t i = 0; i < corners.size(); ++i) {
++        const auto& a = corners[i];
++        const auto& b = corners[(i + 1) % 4];
++        const auto& c = corners[(i + 2) % 4];
++        const double cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
++        if (!(a.x >= 0 && a.x <= 1 && a.y >= 0 && a.y <= 1 && cross > epsilon)) {
++            return std::nullopt;
++        }
++    }
++
++    const auto& [a, b, c, d] = corners;
++    const double dx1 = b.x - c.x;
++    const double dx2 = d.x - c.x;
++    const double dy1 = b.y - c.y;
++    const double dy2 = d.y - c.y;
++    const double sx = a.x - b.x + c.x - d.x;
++    const double sy = a.y - b.y + c.y - d.y;
++    const double determinant = dx1 * dy2 - dx2 * dy1;
++    if (std::abs(determinant) <= epsilon) return std::nullopt;
++
++    const double g = (sx * dy2 - dx2 * sy) / determinant;
++    const double h = (dx1 * sy - sx * dy1) / determinant;
++    return Matrix{b.x - a.x + g * b.x, d.x - a.x + h * d.x, a.x,
++                  b.y - a.y + g * b.y, d.y - a.y + h * d.y, a.y,
++                  g, h, 1};
++}
++
++} // namespace hy300

@@ -1,0 +1,104 @@
+name: Build SurfaceFlinger with Keystone for HY300 Pro (ARM32/Binder64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Builder Repository
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space & Setup Swap
+        run: |
+          echo "=== Initial Disk Space ==="
+          df -h
+          echo "=== Cleaning unneeded packages to free space ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/lib/jvm
+          sudo apt-get clean
+          echo "=== Setting up 12GB Swap to prevent OOM ==="
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== Cleaned Disk Space ==="
+          df -h
+          free -h
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            libc6-dev-i386 libncurses5 x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
+            libxml2-utils xsltproc unzip fontconfig python3 python3-pip rsync bc ccache jq file
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          sudo ln -sf ~/bin/repo /usr/local/bin/repo
+          git config --global user.name "HY300-Builder"
+          git config --global user.email "builder@hy300.local"
+
+      - name: Initialize AOSP 16 & TrebleDroid Manifest
+        run: |
+          mkdir -p aosp
+          cd aosp
+          echo "=== Initializing AOSP 16.0.0_r1 (shallow) ==="
+          repo init -u https://android.googlesource.com/platform/manifest -b android-16.0.0_r1 --depth=1 -g default,-mips,-x86,-darwin,-cts,-vts,-pdk-fs
+          echo "=== Adding TrebleDroid Local Manifests ==="
+          git clone --depth=1 -b android-16.0 https://github.com/TrebleDroid/treble_manifest.git .repo/local_manifests
+          echo "=== Syncing required sources ==="
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j4
+          df -h
+
+      - name: Apply Keystone Patch
+        run: |
+          cd aosp/frameworks/native
+          echo "=== Applying android16-keystone-preview.patch ==="
+          git apply ../../patches/android16-keystone-preview.patch
+          git status
+          git diff --stat
+
+      - name: Compile SurfaceFlinger & RenderEngine
+        run: |
+          cd aosp
+          source build/envsetup.sh
+          lunch treble_a64_bvS-userdebug
+          echo "=== Compiling target modules: surfaceflinger librenderengine ==="
+          m surfaceflinger librenderengine -j$(nproc) 2>&1 | tee build.log
+
+      - name: Package & Verify Artifacts
+        run: |
+          cd aosp
+          OUT_DIR="out/target/product/tdgsi_a64_ab"
+          mkdir -p ../dist
+          
+          echo "=== Copying Binaries and Libraries ==="
+          cp -v ${OUT_DIR}/system/bin/surfaceflinger ../dist/ 2>/dev/null || true
+          cp -v ${OUT_DIR}/system/lib/libsurfaceflinger.so ../dist/ 2>/dev/null || true
+          cp -v ${OUT_DIR}/system/lib/librenderengine.so ../dist/ 2>/dev/null || true
+          cp -v build.log ../dist/
+          
+          cd ../dist
+          echo "=== Architecture Inspection ===" > architecture_report.txt
+          file surfaceflinger libsurfaceflinger.so librenderengine.so >> architecture_report.txt 2>&1 || true
+          readelf -h surfaceflinger >> architecture_report.txt 2>&1 || true
+          readelf -d libsurfaceflinger.so >> architecture_report.txt 2>&1 || true
+          cat architecture_report.txt
+          
+          echo "=== SHA-256 Checksums ===" > sha256_checksums.txt
+          sha256sum * >> sha256_checksums.txt 2>/dev/null || true
+          cat sha256_checksums.txt
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hy300pro-android16-keystone-a64
+          path: dist/
+          retention-days: 14
