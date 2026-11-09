@@ -24,6 +24,8 @@ jobs:
           sudo rm -rf /usr/lib/jvm
           sudo apt-get clean
           echo "=== Setting up 12GB Swap to prevent OOM ==="
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
           sudo fallocate -l 12G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
